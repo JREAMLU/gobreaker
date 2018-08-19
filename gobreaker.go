@@ -44,6 +44,11 @@ func (s State) String() string {
 // CircuitBreaker clears the internal Counts either
 // on the change of the state or at the closed-state intervals.
 // Counts ignores the results of the requests sent before clearing.
+//
+// Counts 保存请求数量及其成功/失败
+// 熔断 清除内部Counts
+// 状态的变化或闭合状态的间隔
+// 计数忽略清除前发送的请求的结果
 type Counts struct {
 	Requests             uint32
 	TotalSuccesses       uint32
@@ -52,22 +57,32 @@ type Counts struct {
 	ConsecutiveFailures  uint32
 }
 
+// 请求事件 请求数+1
 func (c *Counts) onRequest() {
 	c.Requests++
 }
 
+// 成功事件
+// 请求成功数+1
+// 连续成功数+1
+// 连续失败数 清零
 func (c *Counts) onSuccess() {
 	c.TotalSuccesses++
 	c.ConsecutiveSuccesses++
 	c.ConsecutiveFailures = 0
 }
 
+// 失败事件
+// 请求失败数+1
+// 连续失败数+1
+// 连续成功数 清零
 func (c *Counts) onFailure() {
 	c.TotalFailures++
 	c.ConsecutiveFailures++
 	c.ConsecutiveSuccesses = 0
 }
 
+// 清零
 func (c *Counts) clear() {
 	c.Requests = 0
 	c.TotalSuccesses = 0
@@ -98,6 +113,27 @@ func (c *Counts) clear() {
 // Default ReadyToTrip returns true when the number of consecutive failures is more than 5.
 //
 // OnStateChange is called whenever the state of the CircuitBreaker changes.
+//
+// 熔断配置
+//
+// Name 熔断器的名称
+//
+// MaxRequests 当熔断状态为半开状态时, 允许通过的最大请求数
+// 如果MaxRequests==0，则熔断仅允许1个请求
+//
+// Interval 当处于闭合状态时, 每隔多久清零请求统计
+// 如果Interval==0, 不会触发清除
+// 代表是否在一段时间内的计数清零
+//
+// Timeout 在断开状态时, 每隔timeout时间后切换到半开状态
+// 如果Timeout==0, 默认设置为60s
+//
+// ReadyToTrip 在关闭状态时, 请求出现错误 调用这个方法
+// 返回true 会切换至断开状态
+// 不设置为使用默认方法: 策略 当连续失败次数超过5时, 默认ReadyToTrip返回true, 切换至断开状态
+// 一般在此设置策略
+//
+// OnStateChange 在熔断状态变更时触发这个方法
 type Settings struct {
 	Name          string
 	MaxRequests   uint32
@@ -108,6 +144,8 @@ type Settings struct {
 }
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
+// generation 状态每变化一次，该值增加一次, 如果设置了interval，则在闭合状态时，每隔interval时，也增加一次
+// expiry interval timeout 不同状态下的间隔时间
 type CircuitBreaker struct {
 	name          string
 	maxRequests   uint32
@@ -168,8 +206,10 @@ func NewTwoStepCircuitBreaker(st Settings) *TwoStepCircuitBreaker {
 	}
 }
 
+// 默认timeout 60s
 const defaultTimeout = time.Duration(60) * time.Second
 
+// 默认ReadyToTrip策略 错误超过5次
 func defaultReadyToTrip(counts Counts) bool {
 	return counts.ConsecutiveFailures > 5
 }
@@ -180,6 +220,7 @@ func (cb *CircuitBreaker) Name() string {
 }
 
 // State returns the current state of the CircuitBreaker.
+// 当前状态
 func (cb *CircuitBreaker) State() State {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
@@ -194,6 +235,12 @@ func (cb *CircuitBreaker) State() State {
 // Otherwise, Execute returns the result of the request.
 // If a panic occurs in the request, the CircuitBreaker handles it as an error
 // and causes the same panic again.
+//
+// before
+//
+// request
+//
+// after
 func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{}, error) {
 	generation, err := cb.beforeRequest()
 	if err != nil {
@@ -237,6 +284,7 @@ func (tscb *TwoStepCircuitBreaker) Allow() (done func(success bool), err error) 
 	}, nil
 }
 
+// execute 中请求前执行
 func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
@@ -244,26 +292,35 @@ func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	now := time.Now()
 	state, generation := cb.currentState(now)
 
+	// 状态为断开时, 返回 熔断错误 说明已经熔断了
 	if state == StateOpen {
 		return generation, ErrOpenState
+		// 半开状态 请求计数器>= 允许请求的数量时 返回 too many requests
 	} else if state == StateHalfOpen && cb.counts.Requests >= cb.maxRequests {
 		return generation, ErrTooManyRequests
 	}
 
+	// Request +1
 	cb.counts.onRequest()
 	return generation, nil
 }
 
+// success 请求是否成功 调用不同的事件
 func (cb *CircuitBreaker) afterRequest(before uint64, success bool) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
 	now := time.Now()
 	state, generation := cb.currentState(now)
+	// 当前状态不是半开时 直接返回
+	// 只有闭合, 断开才会改变generation+1
 	if generation != before {
 		return
 	}
 
+	// 当状态为半开时
+	// 成功恢复闭合
+	// 失败继续断开
 	if success {
 		cb.onSuccess(state, now)
 	} else {
@@ -277,6 +334,7 @@ func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 		cb.counts.onSuccess()
 	case StateHalfOpen:
 		cb.counts.onSuccess()
+		// 连续成功数 > 允许请求数 恢复闭合状态
 		if cb.counts.ConsecutiveSuccesses >= cb.maxRequests {
 			cb.setState(StateClosed, now)
 		}
@@ -285,16 +343,23 @@ func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 
 func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 	switch state {
+	// 闭合状态下失败 调用readyToTrip方法 返回true时 设置为断开状态
 	case StateClosed:
 		cb.counts.onFailure()
 		if cb.readyToTrip(cb.counts) {
 			cb.setState(StateOpen, now)
 		}
+	// 半开状态下失败 直接断开
 	case StateHalfOpen:
 		cb.setState(StateOpen, now)
 	}
 }
 
+// 当前状态
+// 关闭状态: expiry有赋值 并且间隔时间到了
+// 调用NewGeneration 清零 并且 设置下一次间隔时间
+//
+// 断开状态: timeout时间到了 设置成半开状态
 func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
 	switch cb.state {
 	case StateClosed:
@@ -319,11 +384,16 @@ func (cb *CircuitBreaker) setState(state State, now time.Time) {
 
 	cb.toNewGeneration(now)
 
+	// 状态变更时触发onStateChange方法
 	if cb.onStateChange != nil {
 		cb.onStateChange(cb.name, prev, state)
 	}
 }
 
+// 生成器
+// 生成器计数
+// counts清零
+// 设置间隔时间
 func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
 	cb.generation++
 	cb.counts.clear()
