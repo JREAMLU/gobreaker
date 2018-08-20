@@ -296,6 +296,7 @@ func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	if state == StateOpen {
 		return generation, ErrOpenState
 		// 半开状态 请求计数器>= 允许请求的数量时 返回 too many requests
+		// 防止并发请求进来, 严格控制maxRequests
 	} else if state == StateHalfOpen && cb.counts.Requests >= cb.maxRequests {
 		return generation, ErrTooManyRequests
 	}
