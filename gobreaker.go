@@ -313,8 +313,7 @@ func (cb *CircuitBreaker) afterRequest(before uint64, success bool) {
 
 	now := time.Now()
 	state, generation := cb.currentState(now)
-	// 当前状态不是半开时 直接返回
-	// 只有闭合, 断开才会改变generation+1
+	// 只有关闭时清理 或者 断开->半开 generation 会 != before
 	if generation != before {
 		return
 	}
